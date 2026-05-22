@@ -13,9 +13,16 @@ const ProtectedRoute = ({ children }) => {
         display: 'flex', 
         justifyContent: 'center', 
         alignItems: 'center', 
-        height: '100vh' 
+        height: '100vh',
+        background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)'
       }}>
-        Loading...
+        <div style={{ 
+          color: 'white', 
+          fontSize: '1.25rem', 
+          fontWeight: '500' 
+        }}>
+          Loading...
+        </div>
       </div>
     );
   }
@@ -32,9 +39,16 @@ const PublicRoute = ({ children }) => {
         display: 'flex', 
         justifyContent: 'center', 
         alignItems: 'center', 
-        height: '100vh' 
+        height: '100vh',
+        background: 'linear-gradient(135deg, #667eea 0%, #764ba2 100%)'
       }}>
-        Loading...
+        <div style={{ 
+          color: 'white', 
+          fontSize: '1.25rem', 
+          fontWeight: '500' 
+        }}>
+          Loading...
+        </div>
       </div>
     );
   }
