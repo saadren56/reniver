@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useRef } from 'react';
 import { useAppStore } from '@/store';
+import { useDebounce } from '@/hooks/use-debounce';
 import { 
   Search, 
   Settings, 
@@ -65,6 +66,7 @@ export default function ChatPage() {
   const {
     currentUser,
     users,
+    searchResults,
     conversations,
     selectedConversation,
     messages,
@@ -74,11 +76,17 @@ export default function ChatPage() {
     notifications,
     friendRequests,
     friends,
+    searchLoading,
+    loading,
     setCurrentUser,
     fetchUsers,
+    searchUsers,
     fetchConversations,
+    fetchMessages,
     setSelectedConversation,
+    getOrCreateDirectConversation,
     sendMessage,
+    toggleTheme,
     setIsTyping,
     addReaction,
     removeReaction,
@@ -87,6 +95,9 @@ export default function ChatPage() {
     setReplyingTo,
     togglePin,
     addNotification,
+    markNotificationAsRead,
+    markAllNotificationsAsRead,
+    clearNotifications,
     sendFriendRequest,
     acceptFriendRequest,
     declineFriendRequest,
@@ -109,6 +120,7 @@ export default function ChatPage() {
   const [editText, setEditText] = useState('');
   const [addFriendOpen, setAddFriendOpen] = useState(false);
   const [friendSearchQuery, setFriendSearchQuery] = useState('');
+  const debouncedFriendSearch = useDebounce(friendSearchQuery, 300);
   const [activeSidebarTab, setActiveSidebarTab] = useState<'conversations' | 'friends' | 'requests'>('conversations');
   const fileInputRef = useRef<HTMLInputElement>(null);
   const emojiPickerRef = useRef<HTMLDivElement>(null);
@@ -144,6 +156,12 @@ export default function ChatPage() {
   useEffect(() => {
     requestNotificationPermission();
   }, []);
+
+  useEffect(() => {
+    if (addFriendOpen) {
+      searchUsers(debouncedFriendSearch);
+    }
+  }, [debouncedFriendSearch, addFriendOpen, searchUsers]);
 
   useEffect(() => {
     const loadCurrentUser = async () => {
@@ -183,18 +201,30 @@ export default function ChatPage() {
   }, [supabase, setCurrentUser, fetchUsers, fetchConversations, fetchFriendRequests, fetchFriends, subscribeToRealtime]);
 
   useEffect(() => {
-    socket.connect();
-    
     socket.on('connect', () => {
+      console.log('Socket.IO connected');
       setSocketConnected(true);
     });
 
     socket.on('disconnect', () => {
+      console.log('Socket.IO disconnected');
       setSocketConnected(false);
     });
 
+    socket.on('connect_error', (error) => {
+      console.log('Socket.IO connection error:', error);
+      setSocketConnected(false);
+    });
+
+    socket.on('error', (error) => {
+      console.log('Socket.IO error:', error);
+    });
+
     return () => {
-      socket.disconnect();
+      socket.off('connect');
+      socket.off('disconnect');
+      socket.off('connect_error');
+      socket.off('error');
     };
   }, []);
 
@@ -246,14 +276,67 @@ export default function ChatPage() {
       }
     });
 
+    socket.on('friend_request:new', (data: { senderId: string; receiverId: string }) => {
+      if (data.receiverId === currentUser.id) {
+        fetchFriendRequests();
+        const sender = users.find(u => u.id === data.senderId);
+        if (sender) {
+          showToast('New Friend Request', `${sender.username} sent you a friend request!`);
+          showBrowserNotification('New Friend Request', `${sender.username} sent you a friend request!`);
+        }
+      }
+    });
+
+    socket.on('friend_request:accepted', (data: { senderId: string; receiverId: string }) => {
+      if (data.senderId === currentUser.id) {
+        fetchFriendRequests();
+        fetchFriends();
+        fetchConversations();
+        const receiver = users.find(u => u.id === data.receiverId);
+        if (receiver) {
+          showToast('Friend Request Accepted', `${receiver.username} accepted your friend request!`);
+          showBrowserNotification('Friend Request Accepted', `${receiver.username} accepted your friend request!`);
+        }
+      }
+    });
+
+    socket.on('friend_request:declined', (data: { senderId: string; receiverId: string }) => {
+      if (data.senderId === currentUser.id) {
+        fetchFriendRequests();
+        const receiver = users.find(u => u.id === data.receiverId);
+        if (receiver) {
+          showToast('Friend Request Declined', `${receiver.username} declined your friend request`);
+        }
+      }
+    });
+
+    socket.on('friend:added', (data: { userId: string; friendId: string }) => {
+      if (data.friendId === currentUser.id || data.userId === currentUser.id) {
+        fetchFriends();
+        fetchConversations();
+      }
+    });
+
+    socket.on('friend:removed', (data: { userId: string; friendId: string }) => {
+      if (data.friendId === currentUser.id || data.userId === currentUser.id) {
+        fetchFriends();
+        fetchConversations();
+      }
+    });
+
     return () => {
       socket.off('presence:online');
       socket.off('presence:offline');
       socket.off('message:new');
       socket.off('typing:start');
       socket.off('typing:stop');
+      socket.off('friend_request:new');
+      socket.off('friend_request:accepted');
+      socket.off('friend_request:declined');
+      socket.off('friend:added');
+      socket.off('friend:removed');
     };
-  }, [socketConnected, currentUser, selectedConversation, sendMessage, setIsTyping]);
+  }, [socketConnected, currentUser, selectedConversation, sendMessage, setIsTyping, users]);
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -422,11 +505,11 @@ export default function ChatPage() {
   };
 
   return (
-    <div className={`h-screen flex ${theme === 'dark' ? 'bg-gray-950 text-white' : 'bg-white text-gray-900'}`}>
+    <div className={`h-screen flex flex-col md:flex-row ${theme === 'dark' ? 'bg-gray-950 text-white' : 'bg-gray-100 text-gray-900'}`}>
       {/* Sidebar */}
-      <div className={`w-72 md:w-80 border-r flex flex-col ${theme === 'dark' ? 'bg-gray-900 border-gray-800' : 'bg-gray-50 border-gray-200'}`}>
+      <div className={`w-full md:w-72 lg:w-80 border-r flex flex-col ${theme === 'dark' ? 'bg-[#111b21] border-[#2a3942]' : 'bg-white border-gray-200'}`}>
         {/* Sidebar Header */}
-        <div className="p-4 border-b flex items-center justify-between" style={{ borderColor: theme === 'dark' ? '#1f2937' : '#e5e7eb' }}>
+        <div className={`p-3 border-b flex items-center justify-between ${theme === 'dark' ? 'bg-[#202c33] border-[#2a3942]' : 'bg-[#f0f2f5] border-gray-200'}`}>
           <div className="flex items-center gap-3">
             <Avatar>
               <AvatarImage src={currentUser?.avatar || ''} />
@@ -439,7 +522,169 @@ export default function ChatPage() {
               </p>
             </div>
           </div>
-          <div className="flex gap-2">
+          <div className="flex gap-1">
+            <Dialog 
+              open={addFriendOpen} 
+              onOpenChange={(open) => {
+                if (open) {
+                  fetchUsers();
+                }
+                setAddFriendOpen(open);
+              }}
+            >
+              <DialogTrigger asChild>
+                <Button variant="ghost" size="icon" className="rounded-full relative">
+                  {friendRequests.filter(r => r.receiverId === currentUser?.id && r.status === 'pending').length > 0 && (
+                    <Badge className="absolute -top-1 -right-1 h-4 w-4 p-0 text-[10px] bg-red-500">
+                      {friendRequests.filter(r => r.receiverId === currentUser?.id && r.status === 'pending').length}
+                    </Badge>
+                  )}
+                  <UserPlus className="h-5 w-5" />
+                </Button>
+              </DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Add Friend</DialogTitle>
+                  <DialogDescription>Search for users to send friend requests!</DialogDescription>
+                </DialogHeader>
+                <div className="py-4">
+                  <div className="relative mb-4">
+                    <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-500" />
+                    <Input
+                      placeholder="Search users by email or username..."
+                      value={friendSearchQuery}
+                      onChange={(e) => setFriendSearchQuery(e.target.value)}
+                      className="pl-10"
+                    />
+                  </div>
+                  <div className="space-y-2 max-h-64 overflow-y-auto">
+                    {searchLoading ? (
+                      <div className="flex justify-center py-8">
+                        <Loader2 className="h-8 w-8 animate-spin" />
+                      </div>
+                    ) : (
+                      <>
+                        {searchResults.filter(u => 
+                          !friends.some(f => f.friendId === u.id)
+                        ).map(user => {
+                          const alreadySentRequest = friendRequests.some(r => 
+                            r.senderId === currentUser?.id && r.receiverId === user.id && r.status === 'pending'
+                          );
+                          const alreadyReceivedRequest = friendRequests.some(r => 
+                            r.senderId === user.id && r.receiverId === currentUser?.id && r.status === 'pending'
+                          );
+                          const isOnline = onlineUserIds.includes(user.id);
+                          
+                          return (
+                            <div key={user.id} className="flex items-center justify-between p-3 rounded-lg">
+                              <div className="flex items-center gap-3">
+                                <div className="relative">
+                                  <Avatar className="h-10 w-10">
+                                    <AvatarImage src={user.avatar} />
+                                    <AvatarFallback>{user.username.charAt(0).toUpperCase()}</AvatarFallback>
+                                  </Avatar>
+                                  {isOnline && (
+                                    <div className="absolute bottom-0 right-0 w-2.5 h-2.5 bg-green-500 rounded-full border-2 border-white dark:border-[#202c33]" />
+                                  )}
+                                </div>
+                                <div>
+                                  <p className="font-semibold text-sm">{user.username}</p>
+                                  <p className={`text-xs ${theme === 'dark' ? 'text-gray-400' : 'text-gray-500'}`}>{user.email}</p>
+                                </div>
+                              </div>
+                              {alreadySentRequest ? (
+                                <Button size="sm" variant="ghost" disabled>
+                                  Pending
+                                </Button>
+                              ) : alreadyReceivedRequest ? (
+                                <div className="flex gap-2">
+                                  <Button
+                                    size="sm"
+                                    className="bg-green-600 hover:bg-green-700"
+                                    onClick={() => acceptFriendRequest(friendRequests.find(r => r.senderId === user.id)?.id!)}
+                                  >
+                                    Accept
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    className="text-red-600 hover:text-red-700 hover:bg-red-100 dark:hover:bg-red-900/30"
+                                    onClick={() => declineFriendRequest(friendRequests.find(r => r.senderId === user.id)?.id!)}
+                                  >
+                                    Decline
+                                  </Button>
+                                </div>
+                              ) : (
+                                <Button 
+                                  size="sm" 
+                                  className="bg-[#00a884] hover:bg-[#008f6f] text-white"
+                                  onClick={async () => {
+                                    await sendFriendRequest(user.id);
+                                  }}
+                                >
+                                  Add Friend
+                                </Button>
+                              )}
+                            </div>
+                          );
+                        })}
+                        {searchResults.filter(u => 
+                          !friends.some(f => f.friendId === u.id)
+                        ).length === 0 && !searchLoading && (
+                          <p className={`text-sm text-center ${theme === 'dark' ? 'text-gray-400' : 'text-gray-500'}`}>
+                            No users found
+                          </p>
+                        )}
+                      </>
+                    )}
+                  </div>
+                  
+                  {friendRequests.filter(r => r.receiverId === currentUser?.id && r.status === 'pending').length > 0 && (
+                    <div className="mt-4 pt-4 border-t">
+                      <h4 className="text-sm font-semibold mb-3">Pending Requests</h4>
+                      <div className="space-y-2">
+                        {friendRequests.filter(r => r.receiverId === currentUser?.id && r.status === 'pending').map(request => {
+                          const sender = users.find(u => u.id === request.senderId);
+                          if (!sender) return null;
+                          return (
+                            <div key={request.id} className="flex items-center justify-between p-3 rounded-lg">
+                              <div className="flex items-center gap-3">
+                                <Avatar className="h-10 w-10">
+                                  <AvatarImage src={sender.avatar} />
+                                  <AvatarFallback>{sender.username.charAt(0).toUpperCase()}</AvatarFallback>
+                                </Avatar>
+                                <div>
+                                  <p className="font-semibold text-sm">{sender.username}</p>
+                                  <p className={`text-xs ${theme === 'dark' ? 'text-gray-400' : 'text-gray-500'}`}>Wants to add you</p>
+                                </div>
+                              </div>
+                              <div className="flex gap-2">
+                                <Button
+                                  size="sm"
+                                  className="bg-green-600 hover:bg-green-700"
+                                  onClick={() => acceptFriendRequest(request.id)}
+                                >
+                                  Accept
+                                </Button>
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  className="text-red-600 hover:text-red-700 hover:bg-red-100 dark:hover:bg-red-900/30"
+                                  onClick={() => declineFriendRequest(request.id)}
+                                >
+                                  Decline
+                                </Button>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </DialogContent>
+            </Dialog>
+            
             <Link href="/settings">
               <Button variant="ghost" size="icon" className="rounded-full">
                 <Settings className="h-5 w-5" />
@@ -454,14 +699,14 @@ export default function ChatPage() {
         </div>
 
         {/* Sidebar Tabs */}
-        <div className="p-2 border-b" style={{ borderColor: theme === 'dark' ? '#1f2937' : '#e5e7eb' }}>
+        <div className="p-2 border-b" style={{ borderColor: theme === 'dark' ? '#2a3942' : '#e5e7eb' }}>
           <div className="flex gap-1">
             <Button
               variant="ghost"
               size="sm"
               onClick={() => setActiveSidebarTab('conversations')}
               className={`flex-1 ${activeSidebarTab === 'conversations' 
-                ? (theme === 'dark' ? 'bg-gray-800' : 'bg-purple-100 text-purple-900') 
+                ? (theme === 'dark' ? 'bg-[#2a3942]' : 'bg-[#f0f2f5]') 
                 : ''}`}
             >
               <MessageSquare className="h-4 w-4 mr-1" />
@@ -472,36 +717,21 @@ export default function ChatPage() {
               size="sm"
               onClick={() => setActiveSidebarTab('friends')}
               className={`flex-1 ${activeSidebarTab === 'friends' 
-                ? (theme === 'dark' ? 'bg-gray-800' : 'bg-purple-100 text-purple-900') 
+                ? (theme === 'dark' ? 'bg-[#2a3942]' : 'bg-[#f0f2f5]') 
                 : ''}`}
             >
               <UserPlus className="h-4 w-4 mr-1" />
               Friends
             </Button>
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => setActiveSidebarTab('requests')}
-              className={`flex-1 relative ${activeSidebarTab === 'requests' 
-                ? (theme === 'dark' ? 'bg-gray-800' : 'bg-purple-100 text-purple-900') 
-                : ''}`}
-            >
-              {friendRequests.filter(r => r.receiverId === currentUser?.id && r.status === 'pending').length > 0 && (
-                <Badge className="absolute -top-1 -right-1 h-4 w-4 p-0 text-[10px] bg-red-500">
-                  {friendRequests.filter(r => r.receiverId === currentUser?.id && r.status === 'pending').length}
-                </Badge>
-              )}
-              Requests
-            </Button>
           </div>
         </div>
 
         {/* Search Bar */}
-        <div className="p-4">
+        <div className="p-3">
           <div className="relative">
             <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-500" />
             <Input
-              placeholder={`Search ${activeSidebarTab === 'conversations' ? 'conversations' : activeSidebarTab === 'friends' ? 'friends' : 'requests'}...`}
+              placeholder={`Search ${activeSidebarTab === 'conversations' ? 'conversations' : 'friends'}...`}
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               className="pl-10"
@@ -533,70 +763,38 @@ export default function ChatPage() {
               return (
                 <motion.div
                   key={conversation.id}
-                  initial={{ opacity: 0, x: -20 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  transition={{ 
-                    duration: 0.3, 
-                    delay: index * 0.05,
-                    type: 'spring',
-                    stiffness: 200,
-                    damping: 20
-                  }}
-                  whileHover={{ scale: 1.02, x: 4 }}
-                  whileTap={{ scale: 0.98 }}
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  transition={{ duration: 0.2, delay: index * 0.02 }}
+                  whileHover={{ backgroundColor: theme === 'dark' ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.03)' }}
                   onClick={() => setSelectedConversation(conversation)}
-                  className={`p-4 cursor-pointer transition-colors ${
+                  className={`p-3 cursor-pointer transition-colors ${
                     selectedConversation?.id === conversation.id
                       ? theme === 'dark'
-                        ? 'bg-gray-800'
-                        : 'bg-purple-50'
-                      : theme === 'dark'
-                      ? 'hover:bg-gray-800'
-                      : 'hover:bg-gray-100'
-                  }`}
-                >
+                        ? 'bg-[#2a3942]'
+                        : 'bg-[#f0f2f5]'
+                      : ''
+                  }`}>
                   <div className="flex gap-3">
                     <div className="relative">
-                      <Avatar>
+                      <Avatar className="h-12 w-12">
                         <AvatarImage src={avatarSrc || ''} />
                         <AvatarFallback>{avatarFallback}</AvatarFallback>
                       </Avatar>
-                      <AnimatePresence>
-                        {isOnline && (
-                          <motion.div
-                            initial={{ scale: 0, opacity: 0 }}
-                            animate={{ scale: 1, opacity: 1 }}
-                            exit={{ scale: 0, opacity: 0 }}
-                            className="absolute bottom-0 right-0 w-3 h-3 bg-green-500 rounded-full border-2 border-white dark:border-gray-900"
-                          />
-                        )}
-                      </AnimatePresence>
+                      {isOnline && (
+                        <div className="absolute bottom-0 right-0 w-3.5 h-3.5 bg-green-500 rounded-full border-2 border-white dark:border-[#111b21]" />
+                      )}
                     </div>
                     <div className="flex-1 min-w-0">
                       <div className="flex justify-between items-start">
-                        <p className="font-semibold truncate">{displayName}</p>
-                        <span className={`text-xs ${theme === 'dark' ? 'text-gray-400' : 'text-gray-500'}`}>
+                        <p className="font-medium truncate text-base">{displayName}</p>
+                        <span className={`text-xs ${theme === 'dark' ? 'text-gray-500' : 'text-gray-500'}`}>
                           {formatTime(conversation.lastMessage.timestamp)}
                         </span>
                       </div>
-                      <div className="flex justify-between items-center mt-1">
-                        <p className={`text-sm truncate ${theme === 'dark' ? 'text-gray-400' : 'text-gray-600'}`}>
-                          {conversation.lastMessage.text}
-                        </p>
-                        <AnimatePresence>
-                          {conversation.unreadCount > 0 && (
-                            <motion.div
-                              initial={{ scale: 0 }}
-                              animate={{ scale: 1 }}
-                              transition={{ type: 'spring', stiffness: 400, damping: 15 }}
-                            >
-                              <Badge className="ml-2 bg-purple-600 hover:bg-purple-700">
-                                {conversation.unreadCount}
-                              </Badge>
-                            </motion.div>
-                          )}
-                        </AnimatePresence>
-                      </div>
+                      <p className={`text-sm truncate mt-0.5 ${theme === 'dark' ? 'text-gray-400' : 'text-gray-600'}`}>
+                        {conversation.lastMessage.text}
+                      </p>
                     </div>
                   </div>
                 </motion.div>
@@ -605,234 +803,73 @@ export default function ChatPage() {
             </AnimatePresence>
           )}
 
-          {/* Friends Tab */}
           {activeSidebarTab === 'friends' && (
-            <div className="space-y-1 p-2">
-              {(() => {
-                const filteredFriends = friends.filter(friend => 
-                  friend.friend && (
-                    searchQuery === '' || 
-                    friend.friend.username.toLowerCase().includes(searchQuery.toLowerCase()) || 
-                    friend.friend.email.toLowerCase().includes(searchQuery.toLowerCase())
-                  )
+            <div className="space-y-1">
+              {friends.filter(friend => {
+                const username = friend?.username ?? "";
+                const email = friend?.email ?? "";
+                return (
+                  username.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                  email.toLowerCase().includes(searchQuery.toLowerCase())
                 );
-
-                if (filteredFriends.length === 0) {
-                  return (
-                    <div className="p-8 text-center">
-                      <p className={`text-sm ${theme === 'dark' ? 'text-gray-400' : 'text-gray-500'}`}>
-                        No friends yet
-                      </p>
-                    </div>
-                  );
-                }
-
-                return filteredFriends.map(friendEntry => {
-                  if (!friendEntry.friend) return null;
-                  const friend = friendEntry.friend;
-                  const isOnline = onlineUserIds.includes(friend.id);
-                  
-                  return (
-                    <div key={friendEntry.id} className="flex items-center justify-between p-3 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800">
-                      <div className="flex items-center gap-3">
-                        <div className="relative">
-                          <Avatar>
-                            <AvatarImage src={friend.avatar} />
-                            <AvatarFallback>{friend.username.charAt(0).toUpperCase()}</AvatarFallback>
-                          </Avatar>
-                          {isOnline && (
-                            <div className="absolute bottom-0 right-0 w-3 h-3 bg-green-500 rounded-full border-2 border-white dark:border-gray-900" />
-                          )}
-                        </div>
-                        <div>
-                          <p className="font-semibold text-sm">{friend.username}</p>
-                          <p className={`text-xs ${theme === 'dark' ? 'text-gray-400' : 'text-gray-500'}`}>{isOnline ? 'Online' : 'Offline'}</p>
-                        </div>
-                      </div>
-                      <div className="flex gap-1">
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          onClick={() => {
-                            const conv = conversations.find(c => c.type === 'direct' && c.user?.id === friend.id);
-                            if (conv) setSelectedConversation(conv);
-                          }}
-                        >
-                          Message
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          className="text-red-600 hover:text-red-700 hover:bg-red-100 dark:hover:bg-red-900/30"
-                          onClick={() => removeFriend(friend.id)}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </div>
-                    </div>
-                  );
-                });
-              })()}
-            </div>
-          )}
-
-          {/* Requests Tab */}
-          {activeSidebarTab === 'requests' && (
-            <div className="space-y-2 p-2">
-              {(() => {
-                const pendingRequests = friendRequests.filter(r => 
-                  r.receiverId === currentUser?.id && r.status === 'pending'
-                );
-
-                if (pendingRequests.length === 0) {
-                  return (
-                    <div className="p-8 text-center">
-                      <p className={`text-sm ${theme === 'dark' ? 'text-gray-400' : 'text-gray-500'}`}>
-                        No pending requests
-                      </p>
-                    </div>
-                  );
-                }
-
-                return pendingRequests.map(request => {
-                  const sender = users.find(u => u.id === request.senderId);
-                  if (!sender) return null;
-                  
-                  return (
-                    <div key={request.id} className="flex items-center justify-between p-3 rounded-lg border">
-                      <div className="flex items-center gap-3">
-                        <Avatar>
-                          <AvatarImage src={sender.avatar} />
-                          <AvatarFallback>{sender.username.charAt(0).toUpperCase()}</AvatarFallback>
-                        </Avatar>
-                        <div>
-                          <p className="font-semibold text-sm">{sender.username}</p>
-                          <p className={`text-xs ${theme === 'dark' ? 'text-gray-400' : 'text-gray-500'}`}>{sender.email}</p>
-                        </div>
-                      </div>
-                      <div className="flex gap-2">
-                        <Button
-                          size="sm"
-                          className="bg-green-600 hover:bg-green-700"
-                          onClick={() => acceptFriendRequest(request.id)}
-                        >
-                          Accept
-                        </Button>
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          className="text-red-600 hover:text-red-700 hover:bg-red-100 dark:hover:bg-red-900/30"
-                          onClick={() => declineFriendRequest(request.id)}
-                        >
-                          Decline
-                        </Button>
-                      </div>
-                    </div>
-                  );
-                });
-              })()}
-            </div>
-          )}
-        </div>
-
-        {/* Add Friend Button */}
-        <div className="p-4 border-t" style={{ borderColor: theme === 'dark' ? '#1f2937' : '#e5e7eb' }}>
-          <Dialog open={addFriendOpen} onOpenChange={setAddFriendOpen}>
-            <DialogTrigger asChild>
-              <Button className="w-full bg-purple-600 hover:bg-purple-700">
-                <UserPlus className="h-4 w-4 mr-2" />
-                Add Friend
-              </Button>
-            </DialogTrigger>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Add Friend</DialogTitle>
-                <DialogDescription>Search for users to send friend requests!</DialogDescription>
-              </DialogHeader>
-              <div className="py-4">
-                <div className="relative mb-4">
-                  <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-gray-500" />
-                  <Input
-                    placeholder="Search users by email or username..."
-                    value={friendSearchQuery}
-                    onChange={(e) => setFriendSearchQuery(e.target.value)}
-                    className="pl-10"
-                  />
+              }).length === 0 ? (
+                <div className={`p-8 text-center ${theme === 'dark' ? 'text-gray-500' : 'text-gray-400'}`}>
+                  {friends.length === 0 ? "No friends yet" : "No friends found"}
                 </div>
-                <div className="space-y-2 max-h-64 overflow-y-auto">
-                  {users.filter(u => 
-                    u.id !== currentUser?.id && 
-                    !conversations.some(c => c.type === 'direct' && c.user?.id === u.id) &&
-                    !friendRequests.some(r => 
-                      (r.senderId === currentUser?.id && r.receiverId === u.id) || 
-                      (r.senderId === u.id && r.receiverId === currentUser?.id)
-                    ) &&
-                    (friendSearchQuery === '' || 
-                      u.username.toLowerCase().includes(friendSearchQuery.toLowerCase()) || 
-                      u.email.toLowerCase().includes(friendSearchQuery.toLowerCase()))
-                  ).map(user => {
-                    const alreadySentRequest = friendRequests.some(r => 
-                      r.senderId === currentUser?.id && r.receiverId === user.id && r.status === 'pending'
-                    );
-                    const alreadyReceivedRequest = friendRequests.some(r => 
-                      r.senderId === user.id && r.receiverId === currentUser?.id && r.status === 'pending'
-                    );
-                    
-                    return (
-                      <div key={user.id} className="flex items-center justify-between p-3 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-800">
-                        <div className="flex items-center gap-3">
-                          <Avatar>
-                            <AvatarImage src={user.avatar} />
-                            <AvatarFallback>{user.username.charAt(0).toUpperCase()}</AvatarFallback>
-                          </Avatar>
-                          <div>
-                            <p className="font-semibold text-sm">{user.username}</p>
-                            <p className={`text-xs ${theme === 'dark' ? 'text-gray-400' : 'text-gray-500'}`}>{user.email}</p>
-                          </div>
-                        </div>
-                        {alreadySentRequest ? (
-                          <Button size="sm" variant="ghost" disabled>
-                            Pending
-                          </Button>
-                        ) : alreadyReceivedRequest ? (
-                          <Button size="sm" variant="ghost" disabled>
-                            Check Requests
-                          </Button>
-                        ) : (
-                          <Button 
-                            size="sm" 
-                            className="bg-purple-600 hover:bg-purple-700"
-                            onClick={async () => {
-                              await sendFriendRequest(user.id);
-                              setAddFriendOpen(false);
-                              setFriendSearchQuery('');
-                            }}
-                          >
-                            Send Request
-                          </Button>
+              ) : friends.filter(friend => {
+                const username = friend?.username ?? "";
+                const email = friend?.email ?? "";
+                return (
+                  username.toLowerCase().includes(searchQuery.toLowerCase()) ||
+                  email.toLowerCase().includes(searchQuery.toLowerCase())
+                );
+              }).map((friend) => {
+                const isOnline = onlineUserIds.includes(friend.id);
+                
+                return (
+                  <div
+                    key={friend.id}
+                    className={`p-3 cursor-pointer transition-colors ${
+                      theme === 'dark' 
+                        ? 'hover:bg-[#2a3942]' 
+                        : 'hover:bg-[#f0f2f5]'
+                    }`}
+                    onClick={async () => {
+                      const conversationId = await getOrCreateDirectConversation(friend.id);
+                      if (conversationId) {
+                        const conv = conversations.find(c => c.id === conversationId);
+                        if (conv) {
+                          await setSelectedConversation(conv);
+                          setActiveSidebarTab('conversations');
+                        }
+                      }
+                    }}
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="relative">
+                        <Avatar className="h-12 w-12">
+                          <AvatarImage src={friend?.avatar ?? ''} />
+                          <AvatarFallback>{(friend?.username ?? 'U').charAt(0).toUpperCase()}</AvatarFallback>
+                        </Avatar>
+                        {isOnline && (
+                          <span className="absolute bottom-0 right-0 h-3 w-3 bg-green-500 border-2 rounded-full" style={{ borderColor: theme === 'dark' ? '#111b21' : 'white' }}></span>
                         )}
                       </div>
-                    );
-                  })}
-                  {users.filter(u => 
-                    u.id !== currentUser?.id && 
-                    !conversations.some(c => c.type === 'direct' && c.user?.id === u.id) &&
-                    !friendRequests.some(r => 
-                      (r.senderId === currentUser?.id && r.receiverId === u.id) || 
-                      (r.senderId === u.id && r.receiverId === currentUser?.id)
-                    ) &&
-                    (friendSearchQuery === '' || 
-                      u.username.toLowerCase().includes(friendSearchQuery.toLowerCase()) || 
-                      u.email.toLowerCase().includes(friendSearchQuery.toLowerCase()))
-                  ).length === 0 && (
-                    <p className={`text-sm text-center ${theme === 'dark' ? 'text-gray-400' : 'text-gray-500'}`}>
-                      No users found
-                    </p>
-                  )}
-                </div>
-              </div>
-            </DialogContent>
-          </Dialog>
+                      <div className="flex-1 min-w-0">
+                        <p className="font-medium truncate">{friend?.username ?? 'Unknown'}</p>
+                        <p className={`text-sm truncate ${theme === 'dark' ? 'text-gray-400' : 'text-gray-500'}`}>
+                          {isOnline ? 'Online' : 'Offline'}
+                        </p>
+                      </div>
+                      <Button variant="ghost" size="icon" className="rounded-full">
+                        <MessageSquare className="h-5 w-5" />
+                      </Button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       </div>
 
@@ -841,7 +878,7 @@ export default function ChatPage() {
         {selectedConversation ? (
           <>
             {/* Chat Header */}
-            <div className={`p-4 border-b flex items-center justify-between ${theme === 'dark' ? 'bg-gray-900 border-gray-800' : 'bg-white border-gray-200'}`}>
+            <div className={`p-3 border-b flex items-center justify-between ${theme === 'dark' ? 'bg-[#202c33] border-[#2a3942]' : 'bg-[#f0f2f5] border-gray-200'}`}>
               <div className="flex items-center gap-3">
                 <Avatar>
                   <AvatarImage src={selectedConversation.type === 'group' 
@@ -902,7 +939,7 @@ export default function ChatPage() {
             </AnimatePresence>
 
             {/* Messages */}
-            <div className={`flex-1 overflow-y-auto p-4 space-y-4 ${theme === 'dark' ? 'bg-gray-950' : 'bg-gray-50'}`}>
+            <div className={`flex-1 overflow-y-auto p-4 space-y-2 ${theme === 'dark' ? 'bg-[#0b141a]' : 'bg-[#e5ddd5]'}`} style={{ backgroundImage: theme === 'dark' ? 'url("data:image/svg+xml,%3Csvg width=\'42\' height=\'44\' viewBox=\'0 0 42 44\' xmlns=\'http://www.w3.org/2000/svg\'%3E%3Cg id=\'Page-1\' fill=\'none\' fill-rule=\'evenodd\'%3E%3Cg id=\'Chat-Tile\' fill=\'%23182229\' fill-opacity=\'0.9\'%3E%3Cpath d=\'M20 18c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-2.2 0-4 1.8-4 4v1h8v-1c0-2.2-1.8-4-4-4zm10-10h-1V7c0-.6-.4-1-1-1s-1 .4-1 1v3h-1c-.6 0-1 .4-1 1s.4 1 1 1h3V7c0-.6.4-1 1-1s1 .4 1 1v10h1c.6 0 1-.4 1-1s-.4-1-1-1zm-20 0h-1V7c0-.6-.4-1-1-1s-1 .4-1 1v3h-1c-.6 0-1 .4-1 1s.4 1 1 1h3V7c0-.6.4-1 1-1s1 .4 1 1v10h1c.6 0 1-.4 1-1s-.4-1-1-1z\' /%3E%3C/g%3E%3C/g%3E%3C/svg%3E")' : 'url("data:image/svg+xml,%3Csvg width=\'42\' height=\'44\' viewBox=\'0 0 42 44\' xmlns=\'http://www.w3.org/2000/svg\'%3E%3Cg id=\'Page-1\' fill=\'none\' fill-rule=\'evenodd\'%3E%3Cg id=\'Chat-Tile\' fill=\'%23d3d3d3\' fill-opacity=\'0.9\'%3E%3Cpath d=\'M20 18c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-2.2 0-4 1.8-4 4v1h8v-1c0-2.2-1.8-4-4-4zm10-10h-1V7c0-.6-.4-1-1-1s-1 .4-1 1v3h-1c-.6 0-1 .4-1 1s.4 1 1 1h3V7c0-.6.4-1 1-1s1 .4 1 1v10h1c.6 0 1-.4 1-1s-.4-1-1-1zm-20 0h-1V7c0-.6-.4-1-1-1s-1 .4-1 1v3h-1c-.6 0-1 .4-1 1s.4 1 1 1h3V7c0-.6.4-1 1-1s1 .4 1 1v10h1c.6 0 1-.4 1-1s-.4-1-1-1z\' /%3E%3C/g%3E%3C/g%3E%3C/svg%3E")' }}>
               <AnimatePresence initial={false}>
                 {messages.map((message, index) => (
                   <motion.div
@@ -921,18 +958,17 @@ export default function ChatPage() {
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
                         <motion.div
-                          whileHover={{ scale: 1.02 }}
-                          whileTap={{ scale: 0.98 }}
-                          className={`max-w-[70%] rounded-2xl px-4 py-3 ${
+                          whileHover={{ scale: 1.01 }}
+                          whileTap={{ scale: 0.99 }}
+                          className={`max-w-[65%] px-3 py-2 ${
                             currentUser && message.senderId === currentUser.id
                               ? theme === 'dark'
-                                ? 'bg-purple-600 text-white rounded-tr-none'
-                                : 'bg-gradient-to-r from-purple-600 to-indigo-600 text-white rounded-tr-none'
+                                ? 'bg-[#005c4b] text-white rounded-tl-lg rounded-bl-lg rounded-tr-lg'
+                                : 'bg-[#d9fdd3] text-gray-900 rounded-tl-lg rounded-bl-lg rounded-tr-lg'
                               : theme === 'dark'
-                              ? 'bg-gray-800 text-white rounded-tl-none'
-                              : 'bg-white text-gray-900 rounded-tl-none shadow-sm'
-                          }`}
-                        >
+                              ? 'bg-[#202c33] text-white rounded-tl-lg rounded-bl-lg rounded-tr-lg'
+                              : 'bg-white text-gray-900 rounded-tl-lg rounded-bl-lg rounded-tr-lg shadow-sm'
+                          }`}>
                           {message.replyTo && (
                             <div className={`mb-2 p-2 rounded-lg border-l-2 ${
                               theme === 'dark' 
@@ -1170,7 +1206,7 @@ export default function ChatPage() {
             </AnimatePresence>
 
             {/* Message Input */}
-            <div className={`p-4 border-t ${theme === 'dark' ? 'bg-gray-900 border-gray-800' : 'bg-white border-gray-200'}`}>
+            <div className={`p-3 border-t ${theme === 'dark' ? 'bg-[#202c33] border-[#2a3942]' : 'bg-[#f0f2f5] border-gray-200'}`}>
               <form onSubmit={handleSendMessage} className="flex gap-3">
                 <input
                   type="file"

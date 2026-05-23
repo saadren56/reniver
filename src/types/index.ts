@@ -34,6 +34,7 @@ export interface Message {
   deleted?: boolean;
   replyTo?: MessageReply;
   pinned?: boolean;
+  status?: 'sent' | 'delivered' | 'read';
 }
 
 export type ConversationType = 'direct' | 'group';

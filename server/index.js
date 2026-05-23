@@ -9,9 +9,13 @@ app.use(cors());
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: '*',
-    methods: ['GET', 'POST']
-  }
+    origin: ['http://localhost:3000', 'http://localhost:3001'],
+    methods: ['GET', 'POST'],
+    credentials: true
+  },
+  transports: ['websocket'],
+  pingInterval: 10000,
+  pingTimeout: 5000,
 });
 
 const onlineUsers = new Map();
@@ -39,6 +43,41 @@ io.on('connection', (socket) => {
 
   socket.on('message:seen', (data) => {
     socket.broadcast.emit('message:seen', data);
+  });
+
+  socket.on('friend_request:send', (data) => {
+    const receiverSocketId = onlineUsers.get(data.receiverId);
+    if (receiverSocketId) {
+      io.to(receiverSocketId).emit('friend_request:new', data);
+    }
+  });
+
+  socket.on('friend_request:accept', (data) => {
+    const senderSocketId = onlineUsers.get(data.senderId);
+    if (senderSocketId) {
+      io.to(senderSocketId).emit('friend_request:accepted', data);
+    }
+  });
+
+  socket.on('friend_request:decline', (data) => {
+    const senderSocketId = onlineUsers.get(data.senderId);
+    if (senderSocketId) {
+      io.to(senderSocketId).emit('friend_request:declined', data);
+    }
+  });
+
+  socket.on('friend:added', (data) => {
+    const friendSocketId = onlineUsers.get(data.friendId);
+    if (friendSocketId) {
+      io.to(friendSocketId).emit('friend:added', data);
+    }
+  });
+
+  socket.on('friend:removed', (data) => {
+    const friendSocketId = onlineUsers.get(data.friendId);
+    if (friendSocketId) {
+      io.to(friendSocketId).emit('friend:removed', data);
+    }
   });
 
   socket.on('disconnect', () => {

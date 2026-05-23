@@ -1,14 +1,14 @@
-import { createServerClient, type CookieOptions } from '@supabase/ssr'
+import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
 
-export async function proxy(request: NextRequest) {
+export async function middleware(request: NextRequest) {
   let response = NextResponse.next({
     request: {
       headers: request.headers,
     },
   })
 
-  const supabase = await createServerClient(
+  const supabase = createServerClient(
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
     {
@@ -35,8 +35,8 @@ export async function proxy(request: NextRequest) {
 
   if (
     !user &&
-    request.nextUrl.pathname.startsWith('/chat') ||
-    request.nextUrl.pathname.startsWith('/settings')
+    (request.nextUrl.pathname.startsWith('/chat') ||
+      request.nextUrl.pathname.startsWith('/settings'))
   ) {
     return NextResponse.redirect(new URL('/login', request.url))
   }

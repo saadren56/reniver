@@ -91,6 +91,16 @@ CREATE POLICY "Users can view members of conversations they are part of"
     )
   );
 
+CREATE POLICY "Users can add members to conversations they created"
+  ON conversation_members FOR INSERT
+  WITH CHECK (
+    EXISTS (
+      SELECT 1 FROM conversations
+      WHERE conversations.id = conversation_members.conversation_id
+      AND conversations.created_by = auth.uid()
+    )
+  );
+
 CREATE POLICY "Users can add themselves to conversations"
   ON conversation_members FOR INSERT
   WITH CHECK (auth.uid() = user_id);

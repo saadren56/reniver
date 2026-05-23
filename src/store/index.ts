@@ -1,13 +1,15 @@
+'use client';
+
 import { create } from 'zustand';
 import { User, Message, Conversation, MessageReaction, Notification, FriendRequest, Friend } from '@/types';
 import { createClient } from '@/lib/supabase/client';
 import { RealtimeChannel } from '@supabase/supabase-js';
-
-const supabase = createClient();
+import { getSocket } from '@/lib/socket';
 
 interface AppState {
   currentUser: User | null;
   users: User[];
+  searchResults: User[];
   conversations: Conversation[];
   selectedConversation: Conversation | null;
   messages: Message[];
@@ -18,6 +20,7 @@ interface AppState {
   friendRequests: FriendRequest[];
   friends: Friend[];
   loading: boolean;
+  searchLoading: boolean;
   // Track active channels so we can destroy them on cleanups
   channels: RealtimeChannel[];
   
@@ -25,9 +28,11 @@ interface AppState {
   unsubscribeFromRealtime: () => void;
   setCurrentUser: (user: User | null) => void;
   fetchUsers: () => Promise<void>;
+  searchUsers: (query: string) => Promise<void>;
   fetchConversations: () => Promise<void>;
   fetchMessages: (conversationId: string) => Promise<void>;
   setSelectedConversation: (conversation: Conversation | null) => Promise<void>;
+  getOrCreateDirectConversation: (friendId: string) => Promise<string | null>;
   sendMessage: (text: string, replyTo?: Message) => Promise<void>;
   toggleTheme: () => void;
   setIsTyping: (typing: boolean) => void;
@@ -52,6 +57,7 @@ interface AppState {
 export const useAppStore = create<AppState>((set, get) => ({
   currentUser: null,
   users: [],
+  searchResults: [],
   conversations: [],
   selectedConversation: null,
   messages: [],
@@ -62,7 +68,57 @@ export const useAppStore = create<AppState>((set, get) => ({
   friendRequests: [],
   friends: [],
   loading: true,
+  searchLoading: false,
   channels: [],
+
+  getOrCreateDirectConversation: async (friendId) => {
+    const { currentUser, fetchConversations } = get();
+    const supabase = createClient();
+    if (!currentUser) return null;
+
+    try {
+      const { data: existingConversations } = await supabase
+        .from('conversations')
+        .select(`
+          *,
+          conversation_members (
+            user_id,
+            profiles!inner ( id, username, email, avatar_url )
+          ),
+          messages ( id, content, media_url, media_type, created_at, sender_id )
+        `)
+        .eq('is_group', false);
+
+      if (existingConversations) {
+        for (const conv of existingConversations) {
+          const memberIds = conv.conversation_members?.map((m: any) => m.user_id);
+          if (memberIds?.includes(currentUser.id) && memberIds?.includes(friendId)) {
+            return conv.id;
+          }
+        }
+      }
+
+      const { data: newConv } = await supabase
+        .from('conversations')
+        .insert({ created_by: currentUser.id, is_group: false })
+        .select('id')
+        .single();
+
+      if (newConv) {
+        await supabase.from('conversation_members').insert({ 
+          conversation_id: newConv.id, 
+          user_id: currentUser.id 
+        });
+      }
+
+      await fetchConversations();
+      return newConv?.id || null;
+
+    } catch (error) {
+      console.error('Error getting or creating conversation:', error);
+      return null;
+    }
+  },
 
   setCurrentUser: (user) => {
     set({ currentUser: user });
@@ -78,54 +134,64 @@ export const useAppStore = create<AppState>((set, get) => ({
     // Clean up any stray existing subscriptions first
     unsubscribeFromRealtime();
 
-    const friendRequestsChannel = supabase
-      .channel('friend_requests_changes')
-      .on('postgres_changes', 
-        { event: '*', schema: 'public', table: 'friend_requests' }, 
-        () => { fetchFriendRequests(); }
-      )
-      .subscribe();
+    const supabase = createClient();
+    const socket = getSocket();
 
-    const friendsChannel = supabase
-      .channel('friends_changes')
-      .on('postgres_changes', 
-        { event: '*', schema: 'public', table: 'friends' }, 
-        () => { fetchFriends(); }
-      )
-      .subscribe();
+    const friendRequestsChannel = supabase.channel('friend_requests_changes');
+    friendRequestsChannel.on('postgres_changes', 
+      { event: '*', schema: 'public', table: 'friend_requests' }, 
+      () => { fetchFriendRequests(); }
+    );
 
-    const conversationsChannel = supabase
-      .channel('conversations_changes')
-      .on('postgres_changes', 
-        { event: '*', schema: 'public', table: 'conversations' }, 
-        () => { fetchConversations(); }
-      )
-      .subscribe();
+    const friendsChannel = supabase.channel('friends_changes');
+    friendsChannel.on('postgres_changes', 
+      { event: '*', schema: 'public', table: 'friends' }, 
+      () => { fetchFriends(); }
+    );
 
-    const messagesChannel = supabase
-      .channel('messages_changes')
-      .on('postgres_changes', 
-        { event: '*', schema: 'public', table: 'messages' }, 
-        (payload) => {
-          const { selectedConversation } = get();
-          if (selectedConversation && payload.new && (payload.new as any).conversation_id === selectedConversation.id) {
-            fetchMessages(selectedConversation.id);
-          }
-          fetchConversations();
+    const conversationsChannel = supabase.channel('conversations_changes');
+    conversationsChannel.on('postgres_changes', 
+      { event: '*', schema: 'public', table: 'conversations' }, 
+      () => { fetchConversations(); }
+    );
+
+    const messagesChannel = supabase.channel('messages_changes');
+    messagesChannel.on('postgres_changes', 
+      { event: '*', schema: 'public', table: 'messages' }, 
+      (payload) => {
+        const { selectedConversation } = get();
+        if (selectedConversation && payload.new && (payload.new as any).conversation_id === selectedConversation.id) {
+          fetchMessages(selectedConversation.id);
         }
-      )
-      .subscribe();
+        fetchConversations();
+      }
+    );
+
+    friendRequestsChannel.subscribe();
+    friendsChannel.subscribe();
+    conversationsChannel.subscribe();
+    messagesChannel.subscribe();
 
     set({ channels: [friendRequestsChannel, friendsChannel, conversationsChannel, messagesChannel] });
   },
 
   unsubscribeFromRealtime: () => {
     const { channels } = get();
-    channels.forEach(channel => supabase.removeChannel(channel));
+    const supabase = createClient();
+    channels.forEach(channel => {
+      if (channel) {
+        try {
+          supabase.removeChannel(channel);
+        } catch (e) {
+          console.error('Error removing channel:', e);
+        }
+      }
+    });
     set({ channels: [] });
   },
 
   fetchUsers: async () => {
+    const supabase = createClient();
     try {
       const { data } = await supabase.from('profiles').select('*');
       if (data) {
@@ -143,7 +209,42 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
+  searchUsers: async (query: string) => {
+    const { currentUser } = get();
+    const supabase = createClient();
+    set({ searchLoading: true });
+    try {
+      let dbQuery = supabase.from('profiles').select('*').neq('id', currentUser?.id || '');
+      
+      if (query && query.trim()) {
+        dbQuery = dbQuery.or(`username.ilike.%${query}%,email.ilike.%${query}%`);
+      }
+      
+      dbQuery = dbQuery.limit(20);
+      
+      const { data } = await dbQuery;
+      if (data) {
+        const searchResults: User[] = data.map(profile => ({
+          id: profile.id,
+          username: profile.username || 'User',
+          email: profile.email || '',
+          avatar: profile.avatar_url || '',
+          status: 'offline'
+        }));
+        set({ searchResults });
+      } else {
+        set({ searchResults: [] });
+      }
+    } catch (error) {
+      console.error('Error searching users:', error);
+      set({ searchResults: [] });
+    } finally {
+      set({ searchLoading: false });
+    }
+  },
+
   fetchConversations: async () => {
+    const supabase = createClient();
     try {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) return;
@@ -205,6 +306,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   fetchMessages: async (conversationId: string) => {
+    const supabase = createClient();
     try {
       const { data } = await supabase
         .from('messages')
@@ -239,6 +341,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   sendMessage: async (text) => {
     const { selectedConversation, currentUser } = get();
+    const supabase = createClient();
     if (!selectedConversation || !currentUser || !selectedConversation.user) return;
 
     try {
@@ -400,6 +503,8 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   sendFriendRequest: async (userId) => {
     const { currentUser } = get();
+    const supabase = createClient();
+    const socket = getSocket();
     if (!currentUser) return;
 
     try {
@@ -410,17 +515,32 @@ export const useAppStore = create<AppState>((set, get) => ({
           receiver_id: userId,
           status: 'pending'
         });
+      socket.emit('friend_request:send', { senderId: currentUser.id, receiverId: userId });
+      await get().fetchFriendRequests();
     } catch (error) {
       console.error('Error sending friend request:', error);
     }
   },
 
   declineFriendRequest: async (requestId) => {
+    const supabase = createClient();
+    const socket = getSocket();
     try {
+      const { data: request } = await supabase
+        .from('friend_requests')
+        .select('*')
+        .eq('id', requestId)
+        .single();
+        
       await supabase
         .from('friend_requests')
         .update({ status: 'declined' })
         .eq('id', requestId);
+        
+      if (request) {
+        socket.emit('friend_request:decline', { senderId: request.sender_id, receiverId: request.receiver_id });
+      }
+      
       await get().fetchFriendRequests();
     } catch (error) {
       console.error('Error declining friend request:', error);
@@ -429,6 +549,7 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   fetchFriendRequests: async () => {
     const { currentUser, users } = get();
+    const supabase = createClient();
     if (!currentUser) return;
 
     try {
@@ -454,22 +575,26 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   fetchFriends: async () => {
-    const { currentUser, users } = get();
+    const { currentUser } = get();
+    const supabase = createClient();
     if (!currentUser) return;
 
     try {
       const { data } = await supabase
         .from('friends')
-        .select('*')
+        .select(`
+          *,
+          profiles!friends_friend_id_fkey(id, username, email, avatar_url)
+        `)
         .eq('user_id', currentUser.id);
 
       if (data) {
-        const friends: Friend[] = data.map(f => ({
-          id: f.id,
-          userId: f.user_id,
-          friendId: f.friend_id,
-          createdAt: new Date(f.created_at),
-          friend: users.find(u => u.id === f.friend_id)
+        const friends: User[] = data.map(f => ({
+          id: f.profiles?.id || '',
+          username: f.profiles?.username || 'Unknown',
+          email: f.profiles?.email || '',
+          avatar: f.profiles?.avatar_url || '',
+          status: 'offline'
         }));
         set({ friends });
       }
@@ -480,6 +605,8 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   removeFriend: async (friendId) => {
     const { currentUser } = get();
+    const supabase = createClient();
+    const socket = getSocket();
     if (!currentUser) return;
 
     try {
@@ -487,13 +614,20 @@ export const useAppStore = create<AppState>((set, get) => ({
         .from('friends')
         .delete()
         .or(`and(user_id.eq.${currentUser.id},friend_id.eq.${friendId}),and(user_id.eq.${friendId},friend_id.eq.${currentUser.id})`);
+      
+      socket.emit('friend:removed', { userId: currentUser.id, friendId: friendId });
+      
+      await get().fetchFriends();
+      await get().fetchConversations();
     } catch (error) {
       console.error('Error removing friend:', error);
     }
   },
 
   acceptFriendRequest: async (requestId) => {
-    const { currentUser } = get();
+    const { currentUser, getOrCreateDirectConversation, fetchConversations, fetchFriends, fetchFriendRequests, setSelectedConversation } = get();
+    const supabase = createClient();
+    const socket = getSocket();
     if (!currentUser) return;
 
     try {
@@ -509,28 +643,27 @@ export const useAppStore = create<AppState>((set, get) => ({
         .single();
 
       if (request) {
-        await supabase.from('friends').insert([
-          { user_id: currentUser.id, friend_id: request.sender_id },
-          { user_id: request.sender_id, friend_id: currentUser.id }
-        ]);
+        await supabase.from('friends').insert({ 
+          user_id: currentUser.id, 
+          friend_id: request.sender_id 
+        });
 
-        const { data: newConv } = await supabase
-          .from('conversations')
-          .insert({ created_by: currentUser.id, is_group: false })
-          .select('id')
-          .single();
+        socket.emit('friend_request:accept', { senderId: request.sender_id, receiverId: currentUser.id });
+        socket.emit('friend:added', { userId: currentUser.id, friendId: request.sender_id });
 
-        if (newConv) {
-          await supabase.from('conversation_members').insert([
-            { conversation_id: newConv.id, user_id: currentUser.id },
-            { conversation_id: newConv.id, user_id: request.sender_id }
-          ]);
-          await get().fetchConversations();
+        const conversationId = await getOrCreateDirectConversation(request.sender_id);
+        
+        if (conversationId) {
+          await fetchConversations();
+          const conv = get().conversations.find(c => c.id === conversationId);
+          if (conv) {
+            await setSelectedConversation(conv);
+          }
         }
       }
 
-      await get().fetchFriendRequests();
-      await get().fetchFriends();
+      await fetchFriendRequests();
+      await fetchFriends();
     } catch (error) {
       console.error('Error accepting friend request:', error);
     }
